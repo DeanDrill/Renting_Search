@@ -11,16 +11,34 @@ import {
 import {
   Button,
   Input,
+  InputNumber,
   message,
+  Modal,
+  Progress,
   Select,
   Slider,
 } from "antd";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Helmet } from "react-helmet";
 import { useSearchParams } from "react-router-dom";
+import {
+  computeCommute,
+  type CommuteResult,
+  locateHouse,
+  runPool,
+  searchPoi,
+} from "./commute";
+import {
+  addManualHouses,
+  loadManualHouses,
+  MANUAL_SOURCE,
+  parseManualInput,
+  removeManualHouse,
+} from "./manual";
 import styles from "./styles.module.css";
 
-const AMAP_KEY = "8b942f01c2c6b908b8594f86c07c1725";
+const AMAP_KEY = import.meta.env.VITE_AMAP_KEY || "8b942f01c2c6b908b8594f86c07c1725";
+const AMAP_SECURITY_CODE = import.meta.env.VITE_AMAP_SECURITY_CODE;
 const AMAP_SCRIPT_ID = "house-search-amap";
 const AMAP_UI_SCRIPT_ID = "house-search-amap-ui";
 
@@ -47,7 +65,16 @@ interface MarkerPayload {
   title: string;
   displayMoney: string;
   sourceContent: string;
+  commute?: CommuteResult;
 }
+
+interface CommuteMatch {
+  house: HouseListItem;
+  lnglat: LngLatTuple;
+  commute: CommuteResult;
+}
+
+const FATAL_AMAP_ERROR = /DAILY|INVALID_USER|USERKEY|SCODE|DOMAIN|INSUFFICIENT|ACCESS_DENIED|SERVICE_NOT/i;
 
 interface FilterDraft {
   city: string;
@@ -88,10 +115,14 @@ function loadScript(id: string, src: string) {
 
 async function loadAmap() {
   if (typeof AMap !== "undefined") return;
+  if (AMAP_SECURITY_CODE) {
+    (window as any)._AMapSecurityConfig = { securityJsCode: AMAP_SECURITY_CODE };
+  }
   const plugins = [
     "AMap.Scale",
     "AMap.Geocoder",
     "AMap.Transfer",
+    "AMap.Riding",
     "AMap.AutoComplete",
     "AMap.PlaceSearch",
     "AMap.CitySearch",
@@ -150,9 +181,18 @@ export default function MapPage() {
   const [draft, setDraft] = useState<FilterDraft>(routeFilter);
   const [loading, setLoading] = useState(true);
   const [mapReady, setMapReady] = useState(false);
-  const [workAddress, setWorkAddress] = useState("");
+  const [workAddress, setWorkAddress] = useState(searchParams.get("work") || "");
   const [commuteMinutes, setCommuteMinutes] = useState(45);
   const [commuteMode, setCommuteMode] = useState("");
+  const [ebikeSpeed, setEbikeSpeed] = useState(18);
+  const [maxPrice, setMaxPrice] = useState(6000);
+  const [pageCount, setPageCount] = useState(1);
+  const [commuteRunning, setCommuteRunning] = useState(false);
+  const [commuteProgress, setCommuteProgress] = useState({ done: 0, total: 0 });
+  const [commuteMatches, setCommuteMatches] = useState<CommuteMatch[]>();
+  const [manualOpen, setManualOpen] = useState(false);
+  const [manualText, setManualText] = useState("");
+  const [manualHouses, setManualHouses] = useState<HouseListItem[]>([]);
   const [routePanelOpen, setRoutePanelOpen] = useState(false);
   const [routeSidebarOpen, setRouteSidebarOpen] = useState(false);
   const [commutePosition, setCommutePosition] = useState<LngLatTuple>();
@@ -167,6 +207,8 @@ export default function MapPage() {
   const transferRef = useRef<any>();
   const polygonsRef = useRef<any[]>([]);
   const markerPayloadsRef = useRef(new Map<string, MarkerPayload>());
+  const housesRef = useRef<HouseListItem[]>([]);
+  const commuteAbortRef = useRef(false);
   const commutePositionRef = useRef<LngLatTuple>();
   commutePositionRef.current = commutePosition;
 
@@ -230,11 +272,17 @@ export default function MapPage() {
   const resolveAddress = useCallback((address: string) => {
     return new Promise<LngLatTuple | undefined>((resolve) => {
       const geocoder = geocoderRef.current;
-      if (!geocoder || !address.trim()) {
+      const text = address.trim();
+      if (!geocoder || !text) {
         resolve(undefined);
         return;
       }
-      geocoder.getLocation(address.trim(), (status: string, result: any) => {
+      // AMap never calls back for some addresses lacking a city prefix.
+      const timer = setTimeout(() => resolve(undefined), 8000);
+      const city = routeFilter.city;
+      const query = text.startsWith(city) ? text : `${city}${text}`;
+      geocoder.getLocation(query, (status: string, result: any) => {
+        clearTimeout(timer);
         const location = result?.geocodes?.[0]?.location;
         if (status === "complete" && location) {
           resolve([location.lng, location.lat]);
@@ -243,11 +291,12 @@ export default function MapPage() {
         resolve(undefined);
       });
     });
-  }, []);
+  }, [routeFilter.city]);
 
   const ensureCommutePosition = useCallback(async () => {
     if (commutePositionRef.current) return commutePositionRef.current;
-    const position = await resolveAddress(workAddress || routeFilter.city);
+    const position = (workAddress.trim() && await searchPoi(routeFilter.city, workAddress.trim())) ||
+      await resolveAddress(workAddress || routeFilter.city);
     if (position) {
       setCommutePosition(position);
       return position;
@@ -256,7 +305,10 @@ export default function MapPage() {
     return undefined;
   }, [resolveAddress, routeFilter.city, workAddress]);
 
-  const startTransfer = useCallback(async (destination: LngLatTuple) => {
+  const startTransfer = useCallback(async (
+    destination: LngLatTuple,
+    commute?: CommuteResult,
+  ) => {
     const map = mapRef.current;
     const start = await ensureCommutePosition();
     if (!map || !start) return;
@@ -264,13 +316,15 @@ export default function MapPage() {
     if (routePanelRef.current) routePanelRef.current.innerHTML = "";
     setRoutePanelOpen(true);
     setRouteSidebarOpen(true);
-    const transfer = new AMap.Transfer({
-      city: routeFilter.city,
-      map,
-      panel: routePanelRef.current,
-      extensions: "all",
-      policy: AMap.TransferPolicy.LEAST_DISTANCE,
-    });
+    const transfer = commute?.mode === "ebike"
+      ? new AMap.Riding({ map, panel: routePanelRef.current })
+      : new AMap.Transfer({
+        city: routeFilter.city,
+        map,
+        panel: routePanelRef.current,
+        extensions: "all",
+        policy: AMap.TransferPolicy.LEAST_TIME,
+      });
     transferRef.current = transfer;
     transfer.search(
       new AMap.LngLat(start[0], start[1]),
@@ -287,10 +341,13 @@ export default function MapPage() {
     const content = document.createElement("div");
     content.className = styles.infoWindow;
 
+    const isManual = payload.house.source === MANUAL_SOURCE;
     const title = document.createElement("a");
     title.className = styles.infoTitle;
-    title.href = `/houses/${payload.house.id}`;
+    if (!isManual) title.href = `/houses/${payload.house.id}`;
+    else if (payload.house.onlineURL) title.href = payload.house.onlineURL;
     title.target = "_blank";
+    title.rel = "noreferrer";
     title.textContent = payload.title;
     content.appendChild(title);
 
@@ -304,6 +361,19 @@ export default function MapPage() {
     address.textContent = payload.house.location || payload.house.district || "";
     content.appendChild(address);
 
+    if (payload.commute) {
+      const commute = document.createElement("div");
+      commute.className = styles.infoCommute;
+      commute.textContent = `通勤约 ${payload.commute.minutes} 分钟：${payload.commute.summary}`;
+      content.appendChild(commute);
+      payload.commute.alternatives?.slice(0, 2).forEach((alt) => {
+        const line = document.createElement("div");
+        line.className = styles.infoMeta;
+        line.textContent = `备选 ${alt.minutes} 分钟：${alt.summary}`;
+        content.appendChild(line);
+      });
+    }
+
     const actions = document.createElement("div");
     actions.className = styles.infoActions;
 
@@ -311,12 +381,12 @@ export default function MapPage() {
     collect.type = "button";
     collect.textContent = "收藏";
     collect.addEventListener("click", () => collectHouse(payload.house));
-    actions.appendChild(collect);
+    if (!isManual) actions.appendChild(collect);
 
     const route = document.createElement("button");
     route.type = "button";
     route.textContent = "导航";
-    route.addEventListener("click", () => startTransfer(payload.lnglat));
+    route.addEventListener("click", () => startTransfer(payload.lnglat, payload.commute));
     actions.appendChild(route);
 
     content.appendChild(actions);
@@ -330,13 +400,18 @@ export default function MapPage() {
     infoWindowRef.current.open(map, payload.lnglat);
   }, [collectHouse, startTransfer]);
 
-  const renderMarkers = useCallback((data: HouseListItem[]) => {
+  const renderMarkers = useCallback((
+    data: HouseListItem[],
+    commuteData?: Map<string, CommuteMatch>,
+    fit = true,
+  ) => {
     const map = mapRef.current;
     if (!map) return;
     clearMapOverlays();
     const payloads = data
       .map((house) => {
-        const lnglat = getHouseLngLat(house);
+        const match = commuteData?.get(house.id);
+        const lnglat = match?.lnglat || getHouseLngLat(house);
         if (!lnglat) return undefined;
         const title = house.title || house.location;
         return {
@@ -347,6 +422,7 @@ export default function MapPage() {
           title,
           displayMoney: house.price > 0 ? `￥${house.price}/月` : "",
           sourceContent: house.displaySource || house.source,
+          commute: match?.commute,
         };
       })
       .filter(Boolean) as MarkerPayload[];
@@ -387,6 +463,7 @@ export default function MapPage() {
       });
     }
 
+    if (!fit) return;
     const center = payloads.reduce<LngLatTuple>(
       (acc, payload) => [acc[0] + payload.lnglat[0], acc[1] + payload.lnglat[1]],
       [0, 0] as LngLatTuple,
@@ -400,21 +477,39 @@ export default function MapPage() {
   const loadHouses = useCallback(async () => {
     if (!mapReady) return;
     setLoading(true);
+    commuteAbortRef.current = true;
+    setCommuteMatches(undefined);
     try {
-      const list = await housesService.getMapHouses({
+      const seen = new Set<string>();
+      const list: HouseListItem[] = [];
+      for (let page = 0; page < pageCount; page++) {
+        const items = await housesService.getMapHouses({
           city: routeFilter.city,
           source: routeFilter.source,
           rentType: routeFilter.rentType,
           keyword: routeFilter.keyword,
+          page,
           size: 1200,
         });
+        items.forEach((item) => {
+          if (!seen.has(item.id)) {
+            seen.add(item.id);
+            list.push(item);
+          }
+        });
+        if (items.length < 1200) break;
+      }
+      const manual = loadManualHouses(routeFilter.city);
+      setManualHouses(manual);
+      if (routeFilter.source === "all") list.unshift(...manual);
+      housesRef.current = list;
       renderMarkers(list);
     } catch (error) {
       message.error(error instanceof Error ? error.message : "加载房源失败");
     } finally {
       setLoading(false);
     }
-  }, [mapReady, renderMarkers, routeFilter]);
+  }, [mapReady, pageCount, renderMarkers, routeFilter]);
 
   useEffect(() => {
     let disposed = false;
@@ -487,7 +582,154 @@ export default function MapPage() {
     if (draft.source && draft.source !== "all") next.set("source", draft.source);
     if (draft.rentType !== -1) next.set("rentType", String(draft.rentType));
     if (draft.keyword.trim()) next.set("keyword", draft.keyword.trim());
+    if (workAddress.trim()) next.set("work", workAddress.trim());
     setSearchParams(next);
+  };
+
+  const runCommuteFilter = async (only?: HouseListItem[]) => {
+    if (commuteRunning) {
+      if (!only) commuteAbortRef.current = true;
+      else message.warning("正在筛选，完成后会包含新添加的房源");
+      return;
+    }
+    const office = await ensureCommutePosition();
+    if (!office) return;
+    const houses = (only || housesRef.current).filter(
+      (house) => !house.price || house.price <= maxPrice,
+    );
+    if (!houses.length) {
+      message.warning("当前没有房源");
+      return;
+    }
+    const settings = {
+      city: routeFilter.city,
+      office,
+      maxMinutes: commuteMinutes,
+      ebikeSpeedKmh: ebikeSpeed,
+    };
+    const matches = new Map<string, CommuteMatch>(
+      only ? (commuteMatches || []).map((item) => [item.house.id, item]) : [],
+    );
+    const unlocated: string[] = [];
+    let done = 0;
+    let fatal: Error | undefined;
+    commuteAbortRef.current = false;
+    setCommuteRunning(true);
+    setRouteSidebarOpen(true);
+    if (!only) setCommuteMatches([]);
+    setCommuteProgress({ done: 0, total: houses.length });
+    const publish = (fit: boolean) => {
+      const list = [...matches.values()].sort(
+        (a, b) => a.commute.minutes - b.commute.minutes || a.house.price - b.house.price,
+      );
+      setCommuteMatches(list);
+      renderMarkers(list.map((item) => item.house), matches, fit);
+    };
+    await runPool(houses, 6, async (house) => {
+      if (commuteAbortRef.current || fatal) return;
+      try {
+        const isManual = house.source === MANUAL_SOURCE;
+        const lnglat = getHouseLngLat(house) || await locateHouse(house, office);
+        if (!lnglat && isManual) unlocated.push(house.title);
+        if (lnglat) {
+          const commute = await computeCommute(lnglat, settings);
+          // Manual candidates are always listed so their time is visible even when too long.
+          if (commute && (commute.minutes <= commuteMinutes || isManual)) {
+            matches.set(house.id, { house, lnglat, commute });
+          } else if (!commute && isManual) {
+            unlocated.push(`${house.title}（太远或无路线）`);
+          }
+        }
+      } catch (error) {
+        if (error instanceof Error && FATAL_AMAP_ERROR.test(error.message)) {
+          fatal = error;
+        }
+      }
+      done++;
+      if (done % 25 === 0) {
+        setCommuteProgress({ done, total: houses.length });
+        publish(false);
+      }
+    });
+    setCommuteProgress({ done, total: houses.length });
+    publish(true);
+    setCommuteRunning(false);
+    if (fatal) message.error(`高德地图接口不可用：${fatal.message}`);
+    else if (only) {
+      const lines = only
+        .map((house) => matches.get(house.id))
+        .filter((item): item is CommuteMatch => !!item)
+        .map((item) => `${item.house.title}：${item.commute.minutes} 分钟`);
+      message.success(lines.length ? lines.join("；") : "已添加");
+    } else {
+      message.success(`找到 ${matches.size} 套 ${commuteMinutes} 分钟内可达的房源`);
+    }
+    if (unlocated.length) {
+      message.warning(`定位不到：${unlocated.join("、")}。可以换成更完整的地址再试`, 8);
+    }
+  };
+
+  const exportCsv = () => {
+    const rows = (commuteMatches || []).filter((item) => item.commute.minutes <= commuteMinutes);
+    if (!rows.length) {
+      message.warning("没有可导出的结果");
+      return;
+    }
+    // Prefix formula-like cells so Excel won't evaluate them.
+    const cell = (value: unknown) => {
+      const text = String(value ?? "").replace(/^([=+\-@])/, "'$1");
+      return `"${text.replace(/"/g, '""')}"`;
+    };
+    const header = ["通勤(分钟)", "通勤方式", "月租", "小区", "标题", "区域", "平台", "类型", "发布日期", "链接"];
+    const lines = rows.map(({ house, commute }) => [
+      commute.minutes,
+      commute.summary,
+      house.price || "",
+      (house.title || "").split(/\s+/)[0],
+      house.title,
+      house.district,
+      house.displaySource || house.source,
+      house.displayRentType || "",
+      house.publishDate,
+      house.onlineURL,
+    ].map(cell).join(","));
+    const blob = new Blob(["\ufeff" + [header.map(cell).join(","), ...lines].join("\r\n")], {
+      type: "text/csv;charset=utf-8",
+    });
+    const link = document.createElement("a");
+    link.href = URL.createObjectURL(blob);
+    link.download = `通勤${commuteMinutes}分钟房源-${routeFilter.city}.csv`;
+    link.click();
+    URL.revokeObjectURL(link.href);
+  };
+
+  const submitManual = () => {
+    const added = parseManualInput(manualText, routeFilter.city);
+    if (!added.length) {
+      message.warning("请至少填写一个小区名或地址");
+      return;
+    }
+    addManualHouses(added);
+    setManualHouses((list) => [...list, ...added]);
+    housesRef.current = [...added, ...housesRef.current];
+    setManualText("");
+    setManualOpen(false);
+    runCommuteFilter(added);
+  };
+
+  const deleteManual = (id: string) => {
+    removeManualHouse(id);
+    setManualHouses((list) => list.filter((house) => house.id !== id));
+    housesRef.current = housesRef.current.filter((house) => house.id !== id);
+    if (commuteMatches) {
+      const rest = commuteMatches.filter((item) => item.house.id !== id);
+      setCommuteMatches(rest);
+      renderMarkers(
+        rest.map((item) => item.house),
+        new Map(rest.map((item) => [item.house.id, item])),
+        false,
+      );
+    }
   };
 
   const resetFilter = () => {
@@ -610,7 +852,79 @@ export default function MapPage() {
         <Button className={styles.resetButton} onClick={resetFilter}>
           重置
         </Button>
+        <span className={styles.filterLabel}>房源量:</span>
+        <Select
+          style={{ width: 150 }}
+          value={pageCount}
+          options={[1, 2, 3, 5, 8].map((value) => ({
+            label: `最新 ${value * 1200} 条`,
+            value,
+          }))}
+          onChange={setPageCount}
+        />
+        <span className={styles.filterLabel}>电动车时速:</span>
+        <InputNumber
+          style={{ width: 130 }}
+          min={8}
+          max={25}
+          value={ebikeSpeed}
+          onChange={(value) => setEbikeSpeed(value || 18)}
+          addonAfter="km/h"
+        />
+        <span className={styles.filterLabel}>最高月租:</span>
+        <InputNumber
+          style={{ width: 120 }}
+          min={500}
+          step={500}
+          value={maxPrice}
+          onChange={(value) => setMaxPrice(value || 6000)}
+        />
+        <Button type="primary" onClick={() => runCommuteFilter()} disabled={loading}>
+          {commuteRunning ? "停止" : `通勤 ${commuteMinutes} 分钟筛选`}
+        </Button>
+        <Button onClick={() => setManualOpen(true)} disabled={loading}>
+          + 手动添加（{manualHouses.length}）
+        </Button>
+        <Button onClick={exportCsv} disabled={!commuteMatches?.length || commuteRunning}>
+          导出表格
+        </Button>
       </div>
+
+      <Modal
+        title="手动添加候选房源"
+        open={manualOpen}
+        okText="添加并计算通勤"
+        cancelText="取消"
+        onOk={submitManual}
+        onCancel={() => setManualOpen(false)}
+      >
+        <p className={styles.manualHint}>
+          每行一套：小区名或地址、价格、链接（价格和链接可省略，空格或逗号分隔）。
+          小区名尽量写完整，必要时加上区名，如“番禺 万科欧泊”。
+        </p>
+        <Input.TextArea
+          rows={6}
+          value={manualText}
+          onChange={(event) => setManualText(event.target.value)}
+          placeholder={"万科欧泊 4300 https://www.xiaohongshu.com/explore/...\n海珠 广州四建职工宿舍 1250\n奥园城市天地"}
+        />
+        {manualHouses.length > 0 && (
+          <div className={styles.manualList}>
+            <strong>已添加（{routeFilter.city}）</strong>
+            {manualHouses.map((house) => (
+              <div key={house.id} className={styles.manualRow}>
+                <span>
+                  {house.title}
+                  {house.price ? ` · ￥${house.price}` : ""}
+                </span>
+                <Button type="link" size="small" danger onClick={() => deleteManual(house.id)}>
+                  删除
+                </Button>
+              </div>
+            ))}
+          </div>
+        )}
+      </Modal>
 
       <div
         className={`${styles.mapBody} ${
@@ -618,6 +932,67 @@ export default function MapPage() {
         }`}
       >
         <aside className={styles.navigationPanel}>
+          {commuteMatches && (
+            <div className={styles.commutePanel}>
+              <div className={styles.routeHeader}>
+                <span>
+                  通勤 {commuteMinutes} 分钟内（
+                  {commuteMatches.filter((item) => item.commute.minutes <= commuteMinutes).length} 套）
+                </span>
+              </div>
+              {commuteRunning && (
+                <Progress
+                  className={styles.commuteProgress}
+                  percent={Math.floor(
+                    (commuteProgress.done / Math.max(commuteProgress.total, 1)) * 100,
+                  )}
+                  size="small"
+                />
+              )}
+              {commuteMatches.map((item) => (
+                <div
+                  key={item.house.id}
+                  role="button"
+                  tabIndex={0}
+                  className={styles.commuteItem}
+                  onClick={() => {
+                    mapRef.current?.setZoomAndCenter(15, item.lnglat);
+                    const payload = markerPayloadsRef.current.get(item.house.id);
+                    if (payload) openInfoWindow(payload);
+                  }}
+                >
+                  <strong
+                    className={item.commute.minutes > commuteMinutes ? styles.overLimit : ""}
+                  >
+                    {item.commute.minutes} 分钟 · {item.house.price ? `￥${item.house.price}` : "价格未知"}
+                  </strong>
+                  <span>
+                    {item.house.source === MANUAL_SOURCE ? "【手动】" : ""}
+                    {item.house.title}
+                  </span>
+                  <em>
+                    {item.house.district ? `${item.house.district} · ` : ""}
+                    {item.commute.summary}
+                  </em>
+                  <small>
+                    {item.house.displaySource || item.house.source}
+                    {item.house.displayRentType ? ` · ${item.house.displayRentType}` : ""}
+                    {item.house.publishDate ? ` · ${item.house.publishDate}` : ""}
+                    {item.house.onlineURL && (
+                      <a
+                        href={item.house.onlineURL}
+                        target="_blank"
+                        rel="noreferrer"
+                        onClick={(event) => event.stopPropagation()}
+                      >
+                        看原帖
+                      </a>
+                    )}
+                  </small>
+                </div>
+              ))}
+            </div>
+          )}
           <div className={styles.routePanel}>
             <div className={styles.routeHeader}>
               <span>路线</span>

@@ -14,6 +14,15 @@ export default defineConfig({
       '@': "/src"
     }
   },
+  server: {
+    proxy: {
+      '/amap-subway': {
+        target: 'https://map.amap.com',
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/amap-subway/, '/service/subway'),
+      },
+    },
+  },
   css: {
     postcss: {
       plugins: [

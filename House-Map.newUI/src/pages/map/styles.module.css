@@ -431,6 +431,97 @@
   margin-top: 10px;
 }
 
+.infoCommute {
+  margin-top: 6px;
+  color: #0b7a3e;
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.5;
+}
+
+.commutePanel {
+  max-height: 65%;
+  overflow: auto;
+  border-bottom: 2px solid #dcdfe6;
+}
+
+.commuteProgress {
+  padding: 4px 16px 0;
+}
+
+.commuteItem {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px 16px;
+  border: 0;
+  border-bottom: 1px solid #eef1f4;
+  background: #fff;
+  text-align: left;
+  cursor: pointer;
+}
+
+.commuteItem:hover {
+  background: #f5fbfd;
+}
+
+.commuteItem strong {
+  color: #0b7a3e;
+  font-size: 14px;
+}
+
+.commuteItem span {
+  color: #16212d;
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.commuteItem em {
+  color: #647180;
+  font-size: 12px;
+  font-style: normal;
+}
+
+.commuteItem strong.overLimit {
+  color: #d4380d;
+}
+
+.commuteItem small {
+  color: #8b98a7;
+  font-size: 12px;
+}
+
+.commuteItem small a {
+  margin-left: 8px;
+  color: #0e90d2;
+}
+
+.manualHint {
+  margin-bottom: 8px;
+  color: #647180;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.manualList {
+  max-height: 220px;
+  overflow: auto;
+  margin-top: 12px;
+  padding-top: 8px;
+  border-top: 1px solid #eef1f4;
+}
+
+.manualRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 13px;
+}
+
 .infoActions button {
   height: 28px;
   padding: 0 12px;
